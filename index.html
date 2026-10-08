@@ -191,7 +191,25 @@ document.addEventListener("DOMContentLoaded", () => {
   });
 
   socket.on('role', ({ role }) => {
+    isHost = role === 'host';
     console.log('Assigned role:', role);
+  });
+
+  socket.on('session-error', ({ message }) => {
+    alert(message || 'Unable to join the session.');
+    location.reload();
+  });
+
+  socket.on('peer-left', () => {
+    if (peerConnection) {
+      peerConnection.close();
+      peerConnection = null;
+    }
+    pendingIceCandidates = [];
+    if (!isHost) {
+      guestWaitingOverlay.classList.remove('hidden');
+      videoPlayer.srcObject = null;
+    }
   });
 
   socket.on('peer-ready', (data) => {
@@ -223,7 +241,6 @@ document.addEventListener("DOMContentLoaded", () => {
   const chatBox = document.getElementById('chat-box');
   const chatForm = document.getElementById('chat-form');
   const chatInput = document.getElementById('chat-input');
-  const muteBtn = document.getElementById('mute-btn');
 
   // ---- STATE ----
   let isHost = false;
@@ -231,6 +248,10 @@ document.addEventListener("DOMContentLoaded", () => {
   let localStream = null;
   let remoteStream = null;
   let peerConnection = null;
+  let pendingIceCandidates = [];
+  let videoStream = null;
+  let videoSenders = [];
+  let inParty = false;
 
   const configuration = {
     iceServers: [
@@ -273,6 +294,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
     lobby.classList.add('hidden');
     watchParty.classList.remove('hidden');
+    inParty = true;
 
     // tell server we joined this session (both host & guest)
     socket.emit('join-session', { sessionId });
@@ -320,6 +342,7 @@ document.addEventListener("DOMContentLoaded", () => {
   // ---- WEBRTC SETUP ----
   async function setupWebRTC() {
     try {
+      if (localStream) return;
       // get mic for audio chat with specific constraints for better compatibility
       localStream = await navigator.mediaDevices.getUserMedia({
         video: false,
@@ -330,10 +353,7 @@ document.addEventListener("DOMContentLoaded", () => {
         }
       });
 
-      // create peerConnection if not created
-      if (!peerConnection) {
-        createPeerConnection();
-      }
+      if (!peerConnection) createPeerConnection();
 
       // Show audio enabled indicator
       const audioStatus = document.createElement('div');
@@ -356,6 +376,8 @@ document.addEventListener("DOMContentLoaded", () => {
   }
 
   function createPeerConnection() {
+    if (peerConnection) return peerConnection;
+
     peerConnection = new RTCPeerConnection(configuration);
 
     // ensure remoteStream exists and attach to video element for guests
@@ -442,8 +464,31 @@ document.addEventListener("DOMContentLoaded", () => {
     };
 
     peerConnection.onconnectionstatechange = () => {
-      console.log('PC state:', peerConnection.connectionState);
+      const state = peerConnection.connectionState;
+      console.log('PC state:', state);
+
+      if (state === 'connected') {
+        updateConnectionStatus('connected', '🟢 Media Connected');
+      } else if (state === 'connecting') {
+        updateConnectionStatus('connecting', '🟡 Connecting media…');
+      } else if (state === 'failed') {
+        updateConnectionStatus('error', '🔴 Media connection failed');
+        if (isHost && videoStream) {
+          renegotiate();
+        }
+      } else if (state === 'disconnected') {
+        updateConnectionStatus('connecting', '🟡 Reconnecting media…');
+      }
     };
+
+    peerConnection.oniceconnectionstatechange = () => {
+      if (peerConnection.iceConnectionState === 'failed') {
+        console.warn('ICE connection failed; restarting ICE.');
+        if (isHost && videoStream) renegotiate(true);
+      }
+    };
+
+    return peerConnection;
   }
 
   // ---- FILE SELECT (HOST) ----
@@ -451,12 +496,24 @@ document.addEventListener("DOMContentLoaded", () => {
     const file = event.target.files[0];
     if (!file) return;
 
-    // Clean up previous video stream if it exists
+    if (!videoPlayer.captureStream && !videoPlayer.mozCaptureStream) {
+      alert('Your browser does not support video capture. Please use a recent Chrome, Edge, or Firefox browser.');
+      return;
+    }
+
     if (videoPlayer.src) {
       const oldUrl = videoPlayer.src;
+      videoPlayer.pause();
       videoPlayer.src = '';
       URL.revokeObjectURL(oldUrl);
     }
+
+    if (videoStream) {
+      videoStream.getTracks().forEach(track => track.stop());
+      videoStream = null;
+    }
+
+    videoSenders = [];
 
     const url = URL.createObjectURL(file);
     videoPlayer.src = url;
@@ -466,50 +523,36 @@ document.addEventListener("DOMContentLoaded", () => {
 
     try {
       await videoPlayer.play();
-      const videoStream = videoPlayer.captureStream();
-      
-      // Add video tracks to peer connection
-      videoStream.getTracks().forEach(track => {
-        peerConnection.addTrack(track, videoStream);
-      });
-
-    } catch (e) {
-      console.warn('Autoplay prevented, user must press play to begin streaming');
-      alert('Please press play on the video to start streaming.');
-    }
-
-    // Wait for playback to start (some browsers require play() to populate captureStream)
-    try {
-      await videoPlayer.play();
-    } catch (e) {
-      console.warn('Autoplay prevented, user must press play to begin capture. Prompting user...');
-      // If autoplay prevented, instruct user to press play
-      alert('Please press play on the video to allow streaming to peers.');
+    } catch (error) {
+      console.warn('Autoplay prevented:', error);
+      alert('Press play on the video to start the watch party.');
       return;
     }
 
-    // capture stream from the playing video
-    const videoStream = videoPlayer.captureStream ? videoPlayer.captureStream() : videoPlayer.mozCaptureStream && videoPlayer.mozCaptureStream();
-    if (!videoStream) {
-      alert('Your browser does not support captureStream(). Use Chrome/Edge/Firefox latest versions.');
-      return;
-    }
+    videoStream = videoPlayer.captureStream
+      ? videoPlayer.captureStream()
+      : videoPlayer.mozCaptureStream();
 
-    // create peerConnection if not exists and add tracks
     if (!peerConnection) createPeerConnection();
 
-    videoStream.getTracks().forEach(track => {
-      peerConnection.addTrack(track, videoStream);
+    videoStream.getVideoTracks().forEach(track => {
+      const sender = peerConnection.addTrack(track, videoStream);
+      videoSenders.push(sender);
     });
 
-    // create offer and send to guest
+    await renegotiate();
+  }
+
+  async function renegotiate(iceRestart = false) {
+    if (!peerConnection || !isHost) return;
+
     try {
-      const offer = await peerConnection.createOffer();
+      const offer = await peerConnection.createOffer({ iceRestart });
       await peerConnection.setLocalDescription(offer);
       socket.emit('webrtc-signal', { sessionId, offer });
       console.log('Sent offer');
-    } catch (e) {
-      console.error('Error creating/sending offer', e);
+    } catch (error) {
+      console.error('Error creating/sending offer:', error);
     }
   }
 
@@ -521,75 +564,98 @@ document.addEventListener("DOMContentLoaded", () => {
     socket.on('webrtc-signal', async (data) => {
       try {
         if (data.offer) {
-          console.log('Received offer');
           if (!peerConnection) createPeerConnection();
+
           await peerConnection.setRemoteDescription(new RTCSessionDescription(data.offer));
+
+          const queuedCandidates = pendingIceCandidates;
+          pendingIceCandidates = [];
+          for (const candidate of queuedCandidates) {
+            await peerConnection.addIceCandidate(candidate);
+          }
+
           const answer = await peerConnection.createAnswer();
           await peerConnection.setLocalDescription(answer);
           socket.emit('webrtc-signal', { sessionId, answer });
           console.log('Sent answer');
         } else if (data.answer) {
+          if (!peerConnection) return;
+
+          await peerConnection.setRemoteDescription(new RTCSessionDescription(data.answer));
+
+          const queuedCandidates = pendingIceCandidates;
+          pendingIceCandidates = [];
+          for (const candidate of queuedCandidates) {
+            await peerConnection.addIceCandidate(candidate);
+          }
           console.log('Received answer');
-          if (peerConnection) await peerConnection.setRemoteDescription(new RTCSessionDescription(data.answer));
         } else if (data.candidate) {
-          console.log('Received candidate');
-          if (peerConnection) {
-            try {
-              await peerConnection.addIceCandidate(new RTCIceCandidate(data.candidate));
-            } catch (err) {
-              console.warn('addIceCandidate error', err);
-            }
+          const candidate = new RTCIceCandidate(data.candidate);
+
+          if (peerConnection?.remoteDescription) {
+            await peerConnection.addIceCandidate(candidate);
+          } else {
+            pendingIceCandidates.push(candidate);
           }
         }
-      } catch (e) {
-        console.error('Error handling webrtc-signal', e);
+      } catch (error) {
+        console.error('Error handling WebRTC signal:', error);
       }
     });
 
     socket.on('control', (data) => {
-      if (data && data.time !== undefined) {
-        // Handle controls from either host or guest
-        const timeDiff = Math.abs(videoPlayer.currentTime - data.time);
-        
-        if (timeDiff > 0.5) {
-          videoPlayer.currentTime = data.time;
-        }
-        
-        if (data.action === 'play') {
-          videoPlayer.play().catch(() => {
-            console.log('Playback failed, may need user interaction');
-          });
-        }
-        if (data.action === 'pause') {
-          videoPlayer.pause();
-        }
+      if (!data || data.time === undefined) return;
+
+      const timeDiff = Math.abs(videoPlayer.currentTime - data.time);
+      if (timeDiff > 0.25) {
+        videoPlayer.currentTime = data.time;
+      }
+
+      if (data.action === 'play') {
+        videoPlayer.play().catch(() => {
+          updateConnectionStatus('connecting', '▶ Click the video to start playback');
+        });
+      } else if (data.action === 'pause') {
+        videoPlayer.pause();
+      } else if (data.action === 'seek') {
+        videoPlayer.currentTime = data.time;
       }
     });
 
-    socket.on('chat-message', (data) => {
-      handleChatMessage(data);
-    });
+    socket.on('chat-message', handleChatMessage);
   }
 
   // ---- CHAT UI ----
   function handleChatMessage(data) {
     const messageElement = document.createElement('div');
     messageElement.classList.add('chat-message', 'mb-3', 'flex');
-    const time = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+    const wrapper = document.createElement('div');
     const isOwnMessage = data.sender === (isHost ? 'Host' : 'Guest');
-    
-    const content = `
-      <div class="max-w-[85%] ${isOwnMessage ? 'ml-auto' : ''}">
-        <div class="p-3 rounded-lg ${isOwnMessage ? 'bg-indigo-500 text-white' : 'bg-gray-600 text-white'}">
-          <div class="flex justify-between items-center mb-1">
-            <p class="font-bold text-sm">${data.sender}</p>
-            <span class="text-xs opacity-75">${time}</span>
-          </div>
-          <p class="break-words">${data.text}</p>
-        </div>
-      </div>
-    `;
-    messageElement.innerHTML = content;
+    wrapper.className = `max-w-[85%] ${isOwnMessage ? 'ml-auto' : ''}`;
+
+    const bubble = document.createElement('div');
+    bubble.className = `p-3 rounded-lg ${isOwnMessage ? 'bg-indigo-500 text-white' : 'bg-gray-600 text-white'}`;
+
+    const header = document.createElement('div');
+    header.className = 'flex justify-between items-center mb-1';
+
+    const sender = document.createElement('p');
+    sender.className = 'font-bold text-sm';
+    sender.textContent = data.sender || 'User';
+
+    const time = document.createElement('span');
+    time.className = 'text-xs opacity-75';
+    time.textContent = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+    const text = document.createElement('p');
+    text.className = 'break-words';
+    text.textContent = data.text || '';
+
+    header.append(sender, time);
+    bubble.append(header, text);
+    wrapper.appendChild(bubble);
+    messageElement.appendChild(wrapper);
     chatBox.appendChild(messageElement);
     chatBox.scrollTop = chatBox.scrollHeight;
   }
@@ -688,10 +754,13 @@ document.addEventListener("DOMContentLoaded", () => {
   // Handle connection state changes
   socket.on('connect', () => {
     updateConnectionStatus('connected', '🟢 Connected');
+    if (inParty && sessionId) {
+      socket.emit('join-session', { sessionId });
+    }
   });
 
   socket.on('disconnect', () => {
-    updateConnectionStatus('error', '🔴 Disconnected');
+    updateConnectionStatus('error', '🔴 Disconnected — reconnecting…');
   });
 
   socket.on('connect_error', () => {
