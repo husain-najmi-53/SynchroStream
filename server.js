@@ -15,8 +15,6 @@ const io = new Server(server, {
 });
 
 const PORT = process.env.PORT || 3000;
-const MAX_PARTICIPANTS = 2;
-
 app.use(express.static(path.join(__dirname)));
 
 const activeSessions = new Map();
