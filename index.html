@@ -212,8 +212,11 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   });
 
-  socket.on('peer-ready', (data) => {
-    console.log('Peer ready:', data);
+  socket.on('peer-ready', () => {
+    console.log('Peer ready');
+    if (isHost && videoStream) {
+      restartPeerConnection();
+    }
   });
 
   socket.on('session-full', (data) => {
@@ -474,7 +477,7 @@ document.addEventListener("DOMContentLoaded", () => {
       } else if (state === 'failed') {
         updateConnectionStatus('error', '🔴 Media connection failed');
         if (isHost && videoStream) {
-          renegotiate();
+          restartPeerConnection();
         }
       } else if (state === 'disconnected') {
         updateConnectionStatus('connecting', '🟡 Reconnecting media…');
@@ -484,7 +487,7 @@ document.addEventListener("DOMContentLoaded", () => {
     peerConnection.oniceconnectionstatechange = () => {
       if (peerConnection.iceConnectionState === 'failed') {
         console.warn('ICE connection failed; restarting ICE.');
-        if (isHost && videoStream) renegotiate(true);
+        if (isHost && videoStream) restartPeerConnection();
       }
     };
 
@@ -535,12 +538,27 @@ document.addEventListener("DOMContentLoaded", () => {
 
     if (!peerConnection) createPeerConnection();
 
-    videoStream.getVideoTracks().forEach(track => {
-      const sender = peerConnection.addTrack(track, videoStream);
-      videoSenders.push(sender);
-    });
-
+    addCurrentVideoTracks();
     await renegotiate();
+  }
+
+  function addCurrentVideoTracks() {
+    if (!peerConnection || !videoStream) return;
+    videoSenders = videoStream.getVideoTracks().map(track =>
+      peerConnection.addTrack(track, videoStream)
+    );
+  }
+
+  function restartPeerConnection() {
+    if (peerConnection) {
+      peerConnection.close();
+      peerConnection = null;
+    }
+
+    pendingIceCandidates = [];
+    createPeerConnection();
+    addCurrentVideoTracks();
+    return renegotiate(true);
   }
 
   async function renegotiate(iceRestart = false) {
